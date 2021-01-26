@@ -42,6 +42,22 @@ from ansible.utils.display import Display
 display = Display()
 
 
+def _is_tar_member_path_sane(path):
+    """
+    Check if the given path from a tar member is safe to extract.
+
+    This method looks for common risks that can lure in the path:
+    - Absolute paths that allow to create files outside of the target.
+    - `..` parts that allow to write files outside of the target.
+
+    It does NOT check:
+    - Symbols that are not allowed in environments (like `|` in Windows).
+    - Embedded variables like `$HOME/.config`. Please do not pass paths to a shell.
+    """
+
+    return not path.startswith('/') and all(part != ".." for part in path.split(os.sep))
+
+
 class GalaxyRole(object):
 
     SUPPORTED_SCMS = set(['git', 'hg'])
@@ -211,8 +227,46 @@ class GalaxyRole(object):
 
         return False
 
-    def install(self):
+    def _extract(self, role_tar_file, archive_parent_dir):
+        """
+        Extract contents of the `role_tar_file` into `archive_parent_dir`.
+        """
+        display.display("- Extracting {0} to {1}".format(self.name, self.path))
 
+        if not os.path.exists(self.path):
+            os.makedirs(self.path)
+        elif not os.path.isdir(self.path):
+            raise AnsibleError("The specified roles path {0} exists and is not a directory.".format(self.path))
+        elif not context.CLIARGS.get("force", False):
+            raise AnsibleError("The specified role {0} appears to already exist. Use --force to replace it.".format(self.name))
+        else:
+            # using --force, remove the old path
+            if not self.remove():
+                raise AnsibleError("{0} doesn't appear to contain a role.\n  Please remove this directory ".format(self.path) +
+                                   " manually if you really want to put the role here.")
+
+        # Do the actual extraction to the path.
+        for member in role_tar_file.getmembers():
+            # Strip parent path from tar members (`rolename/tasks/main.yml` becomes `tasks/main.yml`).
+            member.name = member.name.replace(archive_parent_dir + os.sep, "", 1)
+
+            # Only extract regular files and symbolic links.
+            if not member.isreg() and not member.issym():
+                continue
+
+            if _is_tar_member_path_sane(member.name) and not context.CLIARGS.get("force", False):
+                # If a path seems unsane, fail loudly. The old behaviour was to extract the parent directory as an empty file,
+                # which would let the installation fail if the directory contains more than the odd file path.
+                raise AnsibleError("the role {0} has the file path {1}, which contains potentially dangerous symbols. "
+                                   "Use --force to replace it.".format(self.name, member.name))
+
+            # The member path can contain sequences that can be potencially dangerous, check for that.
+            role_tar_file.extract(member, self.path)
+
+        # Write install info file for later use.
+        self._write_galaxy_install_info()
+
+    def install(self):
         if self.scm:
             # create tar file from scm url
             tmp_file = RoleRequirement.scm_archive_role(keep_scm_meta=context.CLIARGS['keep_scm_meta'], **self.spec)
@@ -303,54 +357,24 @@ class GalaxyRole(object):
                     except Exception:
                         raise AnsibleError("this role does not appear to have a valid meta/main.yml file.")
 
-                # we strip off any higher-level directories for all of the files contained within
-                # the tar file here. The default is 'github_repo-target'. Gerrit instances, on the other
-                # hand, does not have a parent directory at all.
-                installed = False
-                while not installed:
-                    display.display("- extracting %s to %s" % (self.name, self.path))
+                for path in self.paths:
+                    self.path = path
                     try:
-                        if os.path.exists(self.path):
-                            if not os.path.isdir(self.path):
-                                raise AnsibleError("the specified roles path exists and is not a directory.")
-                            elif not context.CLIARGS.get("force", False):
-                                raise AnsibleError("the specified role %s appears to already exist. Use --force to replace it." % self.name)
-                            else:
-                                # using --force, remove the old path
-                                if not self.remove():
-                                    raise AnsibleError("%s doesn't appear to contain a role.\n  please remove this directory manually if you really "
-                                                       "want to put the role here." % self.path)
-                        else:
-                            os.makedirs(self.path)
-
-                        # now we do the actual extraction to the path
-                        for member in members:
-                            # we only extract files, and remove any relative path
-                            # bits that might be in the file for security purposes
-                            # and drop any containing directory, as mentioned above
-                            if member.isreg() or member.issym():
-                                n_member_name = to_native(member.name)
-                                n_archive_parent_dir = to_native(archive_parent_dir)
-                                n_parts = n_member_name.replace(n_archive_parent_dir, "", 1).split(os.sep)
-                                n_final_parts = []
-                                for n_part in n_parts:
-                                    if n_part != '..' and '~' not in n_part and '$' not in n_part:
-                                        n_final_parts.append(n_part)
-                                member.name = os.path.join(*n_final_parts)
-                                role_tar_file.extract(member, to_native(self.path))
-
-                        # write out the install info file for later use
-                        self._write_galaxy_install_info()
-                        installed = True
+                        self._extract(role_tar_file, archive_parent_dir)
+                        break
                     except OSError as e:
-                        error = True
-                        if e.errno == errno.EACCES and len(self.paths) > 1:
-                            current = self.paths.index(self.path)
-                            if len(self.paths) > current:
-                                self.path = self.paths[current + 1]
-                                error = False
-                        if error:
-                            raise AnsibleError("Could not update files in %s: %s" % (self.path, to_native(e)))
+                        if os.path.exists(self.path):
+                            rmtree(self.path)
+                        if e.errno == errno.EACCES:
+                            # Had not access to destination directory, eat exception, try other paths.
+                            continue
+                        raise AnsibleError("Could not update files in %s: %s" % (self.path, to_native(e)))
+                    except BaseException:
+                        if os.path.exists(self.path):
+                            rmtree(self.path)
+                        raise
+                else:
+                    raise AnsibleError("Can't write to any installation path: {0}".format(self.paths))
 
                 # return the parsed yaml metadata
                 display.display("- %s was installed successfully" % str(self))
