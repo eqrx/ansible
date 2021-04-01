@@ -22,11 +22,13 @@ Set the dir <team>/<repo>/<run_num> as the value of '-p/--test-path' for this sc
 from __future__ import (absolute_import, division, print_function)
 __metaclass__ = type
 
+import datetime
 import argparse
 import json
 import operator
 import os
 import re
+import requests
 
 from glob import glob
 
@@ -36,29 +38,35 @@ except ImportError:
     argcomplete = None
 
 
+def run_id_arg(arg):
+    m = re.fullmatch(r"(?:https:\/\/dev\.azure\.com\/ansible\/ansible\/_build\/results\?buildId=)?(\d{4})", arg)
+    if not m:
+        raise ValueError("run does not seems to be a URI or an ID")
+    return m.group(1)
+
+
 def main():
-    """Main program body."""
+    """ Main program body. """
+
     args = parse_args()
     rebalance(args)
 
 
 def parse_args():
-    """Parse and return args."""
-    parser = argparse.ArgumentParser(description='Re-balance Shippable group(s) from a downloaded results directory.')
+    """ Parse and return args. """
+
+    parser = argparse.ArgumentParser(description='Re-balance CI group(s) from a downloaded results directory.')
 
     parser.add_argument('group_count',
                         metavar='group_count',
                         help='The number of groups to re-balance the tests to.')
 
+    parser.add_argument('run', metavar='RUN', type=run_id_arg, help='AZP run id or URI')
+
     parser.add_argument('-v', '--verbose',
                         dest='verbose',
                         action='store_true',
                         help='Display more detailed info about files being read and edited.')
-
-    parser.add_argument('-p', '--test-results-path',
-                        dest='test_results_path',
-                        required=True,
-                        help='The directory where the downloaded Shippable job test results are.')
 
     parser.add_argument('-t', '--target-path',
                         dest='target_path',
@@ -74,42 +82,37 @@ def parse_args():
     return args
 
 
-def get_raw_test_targets(args, test_path):
-    """Scans the test directory for all the test targets that was run and get's the max runtime for each target."""
+def datetime_from_ts(ts):
+    return datetime.datetime.strptime(ts.split(".")[0].replace("Z", ""), "%Y-%m-%dT%H:%M:%S")
+
+
+def get_raw_test_targets(args):
+    """ Fetch timeline from AZP and preprocess results. """
+
     target_times = {}
 
-    for job_id in os.listdir(test_path):
-        json_path = os.path.join(test_path, job_id, 'test', 'testresults', 'data')
+    resp = requests.get('https://dev.azure.com/ansible/ansible/_apis/build/builds/%s/timeline?api-version=6.0' % args.run)
+    resp.raise_for_status()
+    timeline = resp.json()
 
-        # Some tests to do not have a data directory
-        if not os.path.exists(json_path):
-            continue
+    name_matcher = re.compile(r'.* - (\d)')
 
-        json_file = glob(os.path.join(json_path, '*integration-*.json'))[0]
-        if not os.path.isfile(json_file):
-            if args.verbose:
-                print("The test json file '%s' does not exist or is not a file, skipping test job run" % json_file)
-            continue
+    for record in timeline['records']:
+        name = record['name']
+        start = datetime_from_ts(record['startTime'])
+        finish = datetime_from_ts(record['finishTime'])
+        duration = finish - start
 
-        with open(json_file, mode='rb') as fd:
-            test_info = json.loads(fd.read().decode('utf-8'))
-
-        targets = test_info.get('targets', {})
-
-        for target_name, target_info in targets.items():
-            target_runtime = int(target_info.get('run_time_seconds', 0))
-
-            # If that target already is found and has a higher runtime than the current one, ignore this entry.
-            if target_times.get(target_name, 0) > target_runtime:
-                continue
-
-            target_times[target_name] = target_runtime
+        match = name_matcher.fullmatch(name)
+        if match:
+            group = match.group(1)
+            target_times[group] = max(duration.seconds, target_times.get(group, 0))
 
     return dict(sorted(target_times.items(), key=lambda i: i[1], reverse=True))
 
 
 def print_test_runtime(target_times):
-    """Prints a nice summary of a dict containing test target names and their runtime."""
+    """ Prints a nice summary of a dict containing test target names and their runtime. """
     target_name_max_len = 0
     for target_name in target_times.keys():
         target_name_max_len = max(target_name_max_len, len(target_name))
@@ -121,9 +124,9 @@ def print_test_runtime(target_times):
 
 
 def rebalance(args):
-    """Prints a nice summary of a proposed rebalanced configuration based on the downloaded Shippable result."""
-    test_path = os.path.expanduser(os.path.expandvars(args.test_results_path))
-    target_times = get_raw_test_targets(args, test_path)
+    """ Prints a nice summary of a proposed rebalanced configuration based on the downloaded CI result. """
+
+    target_times = get_raw_test_targets(args)
 
     group_info = dict([(i, {'targets': [], 'total_time': 0}) for i in range(1, int(args.group_count) + 1)])
 
